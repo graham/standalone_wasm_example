@@ -1,19 +1,20 @@
 use std::io::Read;
-use std::sync::{Arc, Mutex};
 
-use wasmer_runtime::{
-    error, func, instantiate, memory, Array, Ctx, Func, ImportObject, Value, WasmPtr,
-};
+use wasmer_runtime::{func, instantiate, memory, Array, Ctx, ImportObject, Value, WasmPtr};
 use wasmer_runtime_core::import::Namespace;
 
 use bincode;
-use serde::Serialize;
-
 use reqwest;
 
 fn main() {
-    let filename = "./client/target/wasm32-unknown-unknown/release/client.wasm";
+    let debug_result = run_wasm("./client/target/wasm32-unknown-unknown/debug/client.wasm");
+    println!("Debug result: {}", debug_result);
 
+    let release_result = run_wasm("./client/target/wasm32-unknown-unknown/release/client.wasm");
+    println!("Release result: {}", release_result);
+}
+
+fn run_wasm(filename: &str) -> i32 {
     let mut import_object = ImportObject::new();
     let mut ns = Namespace::new();
 
@@ -42,7 +43,10 @@ fn main() {
     let instance = instantiate(b, &import_object).unwrap();
 
     let result = instance.call("doit", &[]).unwrap();
-    println!("Result: {:?}", result);
+    match result.to_vec()[0] {
+        Value::I32(i) => i,
+        _ => -1,
+    }
 }
 
 fn read_argument_payload(ctx: &mut Ctx, ptr: WasmPtr<u8, Array>, len: u32) -> Vec<u8> {

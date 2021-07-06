@@ -65,5 +65,5 @@ pub fn doit() -> i32 {
     let body = get_url("http://www.google.com/");
     println!("body: {}", body);
 
-    1
+    body.len() as i32
 }
