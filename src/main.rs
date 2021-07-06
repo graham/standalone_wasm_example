@@ -49,9 +49,9 @@ fn main() {
             stream.write_all(b"Connection: close\r\n").unwrap();
             stream.write_all(b"\r\n").unwrap();
 
-            debug_instance.call("doit", &[]).unwrap();
-            let g: String = arc.lock().unwrap().clone();
-            stream.write_all(g.as_bytes()).unwrap();
+            //debug_instance.call("doit", &[]).unwrap();
+            //let g: String = arc.lock().unwrap().clone();
+            //stream.write_all(g.as_bytes()).unwrap();
 
             release_instance.call("doit", &[]).unwrap();
             let g: String = arc.lock().unwrap().clone();
