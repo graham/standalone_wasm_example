@@ -3,6 +3,7 @@ use std::net::TcpListener;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
+use wasmer_runtime::types::TableIndex;
 use wasmer_runtime::{
     func, instantiate, memory, Array, Ctx, ImportObject, Instance, Value, WasmPtr,
 };
@@ -10,17 +11,17 @@ use wasmer_runtime_core::import::Namespace;
 
 use bincode;
 use httparse;
-use reqwest;
 
 fn main() {
-    let arc = Arc::new(Mutex::new(String::new()));
+    let debug_arc = Arc::new(Mutex::new(String::new()));
+    let release_arc = Arc::new(Mutex::new(String::new()));
     let (debug_instance,) = run_wasm(
         "./client/target/wasm32-unknown-unknown/debug/client.wasm",
-        Arc::clone(&arc),
+        Arc::clone(&debug_arc),
     );
     let (release_instance,) = run_wasm(
         "./client/target/wasm32-unknown-unknown/release/client.wasm",
-        Arc::clone(&arc),
+        Arc::clone(&release_arc),
     );
 
     let addr = "127.0.0.1:22222";
@@ -49,12 +50,15 @@ fn main() {
             stream.write_all(b"Connection: close\r\n").unwrap();
             stream.write_all(b"\r\n").unwrap();
 
-            //debug_instance.call("doit", &[]).unwrap();
-            //let g: String = arc.lock().unwrap().clone();
-            //stream.write_all(g.as_bytes()).unwrap();
+            debug_instance.call("doit", &[]);
+            let g: String = debug_arc.lock().unwrap().clone();
+            stream.write_all(g.as_bytes()).unwrap();
+            drop(g);
 
-            release_instance.call("doit", &[]).unwrap();
-            let g: String = arc.lock().unwrap().clone();
+            stream.write_all(b"\n\n").unwrap();
+
+            release_instance.call("doit", &[]);
+            let g: String = release_arc.lock().unwrap().clone();
             stream.write_all(g.as_bytes()).unwrap();
         }
     }
@@ -66,31 +70,52 @@ fn run_wasm(filename: &str, arc: Arc<Mutex<String>>) -> (Instance,) {
 
     let data = Arc::clone(&arc);
 
-    let set_response =
-        move |ctx: &mut Ctx, alloc_fn_ptr: u32, ptr: WasmPtr<u8, Array>, len: u32| -> i32 {
-            let slice = read_argument_payload(ctx, ptr, len);
+    let set_response = move |ctx: &mut Ctx,
+                             _alloc_fn_ptr: u32,
+                             dealloc_fn_ptr: u32,
+                             ptr: WasmPtr<u8, Array>,
+                             len: u32|
+          -> i32 {
+        let slice = read_argument_payload(ctx, dealloc_fn_ptr, ptr, len);
+        let url: String = bincode::deserialize(&slice).unwrap();
+        let mut g = data.lock().unwrap();
+        *g = String::from(url).clone();
 
-            let url: String = bincode::deserialize(&slice).unwrap();
-            let mut g = data.lock().unwrap();
-            *g = String::from(url);
+        0
+    };
 
-            0
-        };
+    let unsafe_log = |ctx: &mut Ctx,
+                      _alloc_fn_ptr: u32,
+                      dealloc_fn_ptr: u32,
+                      ptr: WasmPtr<u8, Array>,
+                      len: u32|
+     -> i32 {
+        let slice = read_argument_payload(ctx, dealloc_fn_ptr, ptr, len);
+        let msg: String = bincode::deserialize(&slice).unwrap();
+        println!("LOG:\t {}", msg);
+
+        0
+    };
+
     let fname: String = String::from(filename);
+    let get_url = move |ctx: &mut Ctx,
+                        alloc_fn_ptr: u32,
+                        dealloc_fn_ptr: u32,
+                        ptr: WasmPtr<u8, Array>,
+                        len: u32|
+          -> i32 {
+        let slice = read_argument_payload(ctx, dealloc_fn_ptr, ptr, len);
 
-    let get_url =
-        move |ctx: &mut Ctx, alloc_fn_ptr: u32, ptr: WasmPtr<u8, Array>, len: u32| -> i32 {
-            let slice = read_argument_payload(ctx, ptr, len);
+        let url: String = bincode::deserialize(&slice).unwrap();
+        let body: String = String::from(format!("hello world: {} {}", fname, url));
 
-            let url: String = bincode::deserialize(&slice).unwrap();
-            let body: String = String::from(format!("hello world: {}", fname));
+        let payload = bincode::serialize(&body).unwrap();
+        let ptr = write_response_to_memory(ctx, alloc_fn_ptr, payload);
 
-            let payload = bincode::serialize(&body).unwrap();
-            let ptr = write_response_to_memory(ctx, alloc_fn_ptr, payload);
+        ptr
+    };
 
-            ptr
-        };
-
+    ns.insert("unsafe_log", func!(unsafe_log));
     ns.insert("set_response", func!(set_response));
     ns.insert("unsafe_get_url", func!(get_url));
     import_object.register("env", ns);
@@ -107,7 +132,12 @@ fn run_wasm(filename: &str, arc: Arc<Mutex<String>>) -> (Instance,) {
     (instance,)
 }
 
-fn read_argument_payload(ctx: &mut Ctx, ptr: WasmPtr<u8, Array>, len: u32) -> Vec<u8> {
+fn read_argument_payload(
+    ctx: &mut Ctx,
+    dealloc_fn_ptr: u32,
+    ptr: WasmPtr<u8, Array>,
+    len: u32,
+) -> Vec<u8> {
     let memory = ctx.memory(0);
     let view: memory::MemoryView<u8> = memory.view();
     let slice: Vec<_> = view
@@ -120,11 +150,13 @@ fn read_argument_payload(ctx: &mut Ctx, ptr: WasmPtr<u8, Array>, len: u32) -> Ve
     drop(view);
     drop(memory);
 
-    slice
+    inner_dealloc(ctx, dealloc_fn_ptr, ptr, len);
+
+    slice.clone()
 }
 
 fn write_response_to_memory(ctx: &mut Ctx, alloc_fn_ptr: u32, payload: Vec<u8>) -> i32 {
-    let alloc_fn = unsafe { std::mem::transmute(alloc_fn_ptr) };
+    let alloc_fn: TableIndex = unsafe { std::mem::transmute(alloc_fn_ptr) };
     let memory_required = payload.len();
     let arguments = [Value::I32(memory_required as i32)];
     let result = ctx.call_with_table_index(alloc_fn, &arguments);
@@ -144,9 +176,24 @@ fn write_response_to_memory(ctx: &mut Ctx, alloc_fn_ptr: u32, payload: Vec<u8>) 
             }
         }
         Err(e) => {
-            println!("{:?}", e);
+            println!("Write response error {:?}", e);
         }
     }
 
     return 0;
+}
+
+fn inner_dealloc(ctx: &mut Ctx, dealloc_fn_ptr: u32, ptr: WasmPtr<u8, Array>, len: u32) {
+    let dealloc_fn: TableIndex = unsafe { std::mem::transmute(dealloc_fn_ptr) };
+    let arguments = [Value::I32(ptr.offset() as i32), Value::I32(len as i32)];
+    /*
+    let result = ctx.call_with_table_index(dealloc_fn, &arguments);
+
+    match result {
+        Ok(v) => if let Value::I32(ptr) = v.to_vec()[0] {},
+        Err(e) => {
+            println!("inner dealloc error {:?}", e);
+        }
+    }
+    */
 }

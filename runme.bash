@@ -5,5 +5,5 @@ cargo build --release
 
 cd ../
 
-cargo run
-cargo run --release
+RUST_BACKTRACE=1 cargo run
+
