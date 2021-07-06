@@ -14,6 +14,11 @@ extern "C" {
         ptr: *mut usize,
         len: usize,
     ) -> u32;
+    pub fn set_response(
+        alloc_fn: extern "C" fn(usize) -> *const usize,
+        ptr: *mut usize,
+        len: usize,
+    ) -> u32;
 }
 
 #[no_mangle]
@@ -63,7 +68,11 @@ pub fn get_url(url: &str) -> String {
 #[no_mangle]
 pub fn doit() -> i32 {
     let body = get_url("http://www.google.com/");
-    println!("body: {}", body);
+    let answer = String::from(format!("body: {}", body));
+    let (ptr, len) = write_value_to_mem(answer);
+    unsafe {
+        set_response(alloc, ptr, len);
+    }
 
     body.len() as i32
 }

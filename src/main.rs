@@ -1,35 +1,97 @@
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 
-use wasmer_runtime::{func, instantiate, memory, Array, Ctx, ImportObject, Value, WasmPtr};
+use wasmer_runtime::{
+    func, instantiate, memory, Array, Ctx, ImportObject, Instance, Value, WasmPtr,
+};
 use wasmer_runtime_core::import::Namespace;
 
 use bincode;
+use httparse;
 use reqwest;
 
 fn main() {
-    let debug_result = run_wasm("./client/target/wasm32-unknown-unknown/debug/client.wasm");
-    println!("Debug result: {}", debug_result);
+    let arc = Arc::new(Mutex::new(String::new()));
+    let (debug_instance,) = run_wasm(
+        "./client/target/wasm32-unknown-unknown/debug/client.wasm",
+        Arc::clone(&arc),
+    );
+    let (release_instance,) = run_wasm(
+        "./client/target/wasm32-unknown-unknown/release/client.wasm",
+        Arc::clone(&arc),
+    );
 
-    let release_result = run_wasm("./client/target/wasm32-unknown-unknown/release/client.wasm");
-    println!("Release result: {}", release_result);
+    let addr = "127.0.0.1:22222";
+    let server_sock = TcpListener::bind(addr).unwrap();
+
+    println!("listening...");
+
+    loop {
+        for stream in server_sock.incoming() {
+            let mut stream = stream.unwrap();
+            let mut buffer = [0; 1024 * 4];
+
+            stream.read(&mut buffer).unwrap();
+
+            //let tok = "\r\n\r\n".as_bytes();
+            //let index = buffer.windows(4).position(|w| w == tok);
+
+            let mut headers = [httparse::EMPTY_HEADER; 20];
+            let mut req = httparse::Request::new(&mut headers);
+            let _phead = req.parse(&buffer);
+
+            //println!("Header: {:?}", req.path);
+
+            stream.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+            stream.write_all(b"Content-Type: text/plain\r\n").unwrap();
+            stream.write_all(b"Connection: close\r\n").unwrap();
+            stream.write_all(b"\r\n").unwrap();
+
+            debug_instance.call("doit", &[]).unwrap();
+            let g: String = arc.lock().unwrap().clone();
+            stream.write_all(g.as_bytes()).unwrap();
+
+            release_instance.call("doit", &[]).unwrap();
+            let g: String = arc.lock().unwrap().clone();
+            stream.write_all(g.as_bytes()).unwrap();
+        }
+    }
 }
 
-fn run_wasm(filename: &str) -> i32 {
+fn run_wasm(filename: &str, arc: Arc<Mutex<String>>) -> (Instance,) {
     let mut import_object = ImportObject::new();
     let mut ns = Namespace::new();
 
-    let get_url = |ctx: &mut Ctx, alloc_fn_ptr: u32, ptr: WasmPtr<u8, Array>, len: u32| -> i32 {
-        let slice = read_argument_payload(ctx, ptr, len);
+    let data = Arc::clone(&arc);
 
-        let url: String = bincode::deserialize(&slice).unwrap();
-        let body = reqwest::blocking::get(url).unwrap().text().unwrap();
+    let set_response =
+        move |ctx: &mut Ctx, alloc_fn_ptr: u32, ptr: WasmPtr<u8, Array>, len: u32| -> i32 {
+            let slice = read_argument_payload(ctx, ptr, len);
 
-        let payload = bincode::serialize(&body).unwrap();
-        let ptr = write_response_to_memory(ctx, alloc_fn_ptr, payload);
+            let url: String = bincode::deserialize(&slice).unwrap();
+            let mut g = data.lock().unwrap();
+            *g = String::from(url);
 
-        ptr
-    };
+            0
+        };
+    let fname: String = String::from(filename);
 
+    let get_url =
+        move |ctx: &mut Ctx, alloc_fn_ptr: u32, ptr: WasmPtr<u8, Array>, len: u32| -> i32 {
+            let slice = read_argument_payload(ctx, ptr, len);
+
+            let url: String = bincode::deserialize(&slice).unwrap();
+            let body: String = String::from(format!("hello world: {}", fname));
+
+            let payload = bincode::serialize(&body).unwrap();
+            let ptr = write_response_to_memory(ctx, alloc_fn_ptr, payload);
+
+            ptr
+        };
+
+    ns.insert("set_response", func!(set_response));
     ns.insert("unsafe_get_url", func!(get_url));
     import_object.register("env", ns);
 
@@ -42,11 +104,7 @@ fn run_wasm(filename: &str) -> i32 {
 
     let instance = instantiate(b, &import_object).unwrap();
 
-    let result = instance.call("doit", &[]).unwrap();
-    match result.to_vec()[0] {
-        Value::I32(i) => i,
-        _ => -1,
-    }
+    (instance,)
 }
 
 fn read_argument_payload(ctx: &mut Ctx, ptr: WasmPtr<u8, Array>, len: u32) -> Vec<u8> {
